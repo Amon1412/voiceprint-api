@@ -97,6 +97,21 @@ class Settings:
         """临时文件目录"""
         return self.voiceprint.get("tmp_dir", "tmp")
 
+    @property
+    def cluster_similarity_threshold(self) -> float:
+        """聚类相似度阈值"""
+        return self.voiceprint.get("cluster_similarity_threshold", 0.7)
+
+    @property
+    def cluster_max_files(self) -> int:
+        """单次聚类最大文件数"""
+        return self.voiceprint.get("cluster_max_files", 500)
+
+    @property
+    def cluster_task_expire_hours(self) -> int:
+        """聚类任务过期时间（小时）"""
+        return self.voiceprint.get("cluster_task_expire_hours", 24)
+
 
 # 全局配置实例
 settings = Settings()

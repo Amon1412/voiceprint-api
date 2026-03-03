@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from . import voiceprint, health
+from . import voiceprint, health, cluster
 
 # 创建API路由器
 api_router = APIRouter()
@@ -7,3 +7,4 @@ api_router = APIRouter()
 # 注册各个模块的路由
 api_router.include_router(health.router, tags=["健康检查"])
 api_router.include_router(voiceprint.router, tags=["声纹识别"])
+api_router.include_router(cluster.router, prefix="/cluster", tags=["声纹聚类"])

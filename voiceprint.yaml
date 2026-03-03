@@ -9,11 +9,19 @@ server:
 mysql:
   # MySQL数据库主机地址
   host: "127.0.0.1"
-  # 端口  
+  # 端口
   port: 3306
-  # 用户名          
+  # 用户名
   user: "root"
-  # 用户密码         
+  # 用户密码
   password: "123456"
   # 数据库名
   database: "voiceprint_db"
+
+voiceprint:
+  # 聚类相似度阈值（0-1），越高要求越严格
+  cluster_similarity_threshold: 0.7
+  # 单次聚类最大音频文件数
+  cluster_max_files: 500
+  # 聚类任务过期清理时间（小时）
+  cluster_task_expire_hours: 24
