@@ -127,3 +127,79 @@ class ClusterConfirmResponse(BaseModel):
     success: bool
     registered: List[ClusterRegisteredInfo]
     failed: List[ClusterFailedInfo]
+
+
+# ===== 增量聚类（上传模式）模型 =====
+
+
+class ClusterUploadResponse(BaseModel):
+    """增量聚类上传任务创建响应"""
+
+    task_id: str
+    total_files: int
+    valid_files: int
+    invalid_files: List[InvalidFileInfo]
+
+
+class ClusterUploadFileInfo(BaseModel):
+    """增量聚类中的文件信息（基于audio_id）"""
+
+    audio_id: str
+    distance_to_centroid: float
+
+
+class ClusterUploadInfo(BaseModel):
+    """增量聚类的单个聚类信息"""
+
+    cluster_id: int
+    file_count: int
+    files: List[ClusterUploadFileInfo]
+    # 是否匹配到已有说话人
+    existing_speaker_id: Optional[str] = None
+    existing_speaker_count: Optional[int] = None
+
+
+class ClusterUploadStatusResponse(BaseModel):
+    """增量聚类任务状态响应"""
+
+    task_id: str
+    status: str = Field(description="任务状态: processing, completed, failed")
+    total_files: int
+    processed_files: int
+    progress_percent: float
+    error: Optional[str] = None
+    clusters: Optional[List[ClusterUploadInfo]] = None
+    outliers: Optional[List[str]] = Field(None, description="离群音频ID列表")
+    stats: Optional[ClusterStats] = None
+
+
+class ClusterMergeAssignment(BaseModel):
+    """增量聚类合并分配"""
+
+    cluster_id: int
+    speaker_id: str
+    merge_with_existing: bool = Field(False, description="是否与已有说话人合并")
+
+
+class ClusterMergeConfirmRequest(BaseModel):
+    """增量聚类合并确认请求"""
+
+    assignments: List[ClusterMergeAssignment]
+
+
+class ClusterMergeRegisteredInfo(BaseModel):
+    """增量聚类注册/合并成功信息"""
+
+    speaker_id: str
+    cluster_id: int
+    file_count: int
+    merged: bool = Field(False, description="是否为合并操作")
+    total_count: Optional[int] = Field(None, description="合并后总计数")
+
+
+class ClusterMergeConfirmResponse(BaseModel):
+    """增量聚类合并确认响应"""
+
+    success: bool
+    registered: List[ClusterMergeRegisteredInfo]
+    failed: List[ClusterFailedInfo]

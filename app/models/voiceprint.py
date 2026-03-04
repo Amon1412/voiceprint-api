@@ -21,6 +21,17 @@ class VoiceprintRegisterResponse(BaseModel):
         schema_extra = {"example": {"success": True, "msg": "已登记: user_001"}}
 
 
+class VoiceprintRegisterMultiResponse(BaseModel):
+    """多文件声纹注册响应模型"""
+
+    success: bool
+    msg: str
+    embedding_count: int = 0
+
+    class Config:
+        schema_extra = {"example": {"success": True, "msg": "已登记: user_001", "embedding_count": 3}}
+
+
 class VoiceprintIdentifyRequest(BaseModel):
     """声纹识别请求模型"""
 

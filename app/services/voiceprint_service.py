@@ -236,6 +236,48 @@ class VoiceprintService:
             if audio_path:
                 audio_processor.cleanup_temp_file(audio_path)
 
+    def register_voiceprint_multi(self, speaker_id: str, audio_bytes_list: List[bytes]) -> Tuple[bool, int]:
+        """
+        从多个音频提取embedding，取均值注册声纹
+
+        Args:
+            speaker_id: 说话人ID
+            audio_bytes_list: 多个音频字节数据列表
+
+        Returns:
+            Tuple[bool, int]: (是否成功, 有效embedding数量)
+        """
+        embeddings = []
+        for i, audio_bytes in enumerate(audio_bytes_list):
+            audio_path = None
+            try:
+                if len(audio_bytes) < 1000:
+                    logger.warning(f"音频文件{i}过小，跳过")
+                    continue
+                audio_path = audio_processor.ensure_16k_wav(audio_bytes)
+                emb = self.extract_voiceprint(audio_path)
+                embeddings.append(emb)
+            except Exception as e:
+                logger.warning(f"处理音频文件{i}失败: {e}")
+            finally:
+                if audio_path:
+                    audio_processor.cleanup_temp_file(audio_path)
+
+        if not embeddings:
+            logger.error(f"没有有效的embedding可注册: {speaker_id}")
+            return False, 0
+
+        # 取均值并L2正规化
+        mean_emb = np.mean(embeddings, axis=0).astype(np.float32)
+        norm = np.linalg.norm(mean_emb)
+        if norm > 0:
+            mean_emb = mean_emb / norm
+
+        success = voiceprint_db.save_voiceprint_with_count(speaker_id, mean_emb, len(embeddings))
+        if success:
+            logger.info(f"多文件声纹注册成功: {speaker_id}, 使用{len(embeddings)}个embedding")
+        return success, len(embeddings)
+
     def identify_voiceprint(
         self, speaker_ids: List[str], audio_bytes: bytes
     ) -> Tuple[str, float]:

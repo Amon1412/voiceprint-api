@@ -2,7 +2,7 @@ from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Depends
 from fastapi.security import HTTPBearer
 from typing import List
 import time
-from ...models.voiceprint import VoiceprintRegisterResponse, VoiceprintIdentifyResponse
+from ...models.voiceprint import VoiceprintRegisterResponse, VoiceprintRegisterMultiResponse, VoiceprintIdentifyResponse
 from ...services.voiceprint_service import voiceprint_service
 from ...api.dependencies import AuthorizationToken
 from ...core.logger import get_logger
@@ -137,6 +137,49 @@ async def identify_voiceprint(
         total_time = time.time() - start_time
         logger.error(f"声纹识别异常，总耗时: {total_time:.3f}秒，错误: {e}")
         raise HTTPException(status_code=500, detail=f"声纹识别失败: {str(e)}")
+
+
+@router.post(
+    "/register-multi",
+    summary="多文件声纹注册",
+    response_model=VoiceprintRegisterMultiResponse,
+    description="使用多个音频文件注册声纹，取embedding均值",
+    dependencies=[Depends(security)],
+)
+async def register_voiceprint_multi(
+    token: AuthorizationToken,
+    speaker_id: str = Form(..., description="说话人ID"),
+    files: List[UploadFile] = File(..., description="多个WAV音频文件"),
+):
+    try:
+        if len(files) < 1:
+            raise HTTPException(status_code=400, detail="至少需要1个音频文件")
+        if len(files) > 10:
+            raise HTTPException(status_code=400, detail="最多支持10个音频文件")
+
+        audio_bytes_list = []
+        for f in files:
+            if not f.filename or not f.filename.lower().endswith(".wav"):
+                raise HTTPException(status_code=400, detail=f"只支持WAV格式音频文件，文件 '{f.filename}' 格式不正确")
+            audio_bytes = await f.read()
+            audio_bytes_list.append(audio_bytes)
+
+        success, count = voiceprint_service.register_voiceprint_multi(speaker_id, audio_bytes_list)
+
+        if success:
+            return VoiceprintRegisterMultiResponse(
+                success=True,
+                msg=f"已登记: {speaker_id}，使用{count}个音频",
+                embedding_count=count
+            )
+        else:
+            raise HTTPException(status_code=500, detail="声纹注册失败：无有效音频")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.fail(f"多文件声纹注册异常: {e}")
+        raise HTTPException(status_code=500, detail=f"声纹注册失败: {str(e)}")
 
 
 @router.delete(

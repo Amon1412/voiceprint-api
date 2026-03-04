@@ -114,6 +114,98 @@ class VoiceprintDB:
             logger.error(f"删除声纹特征失败 {speaker_id}: {e}")
             return False
 
+    def save_voiceprint_with_count(self, speaker_id: str, emb: np.ndarray, count: int = 1) -> bool:
+        """
+        保存声纹特征及聚类计数（用于聚类注册）
+
+        Args:
+            speaker_id: 说话人ID
+            emb: 声纹质心向量
+            count: 聚类音频数量
+
+        Returns:
+            bool: 操作是否成功
+        """
+        try:
+            with db_connection.get_cursor() as cursor:
+                sql = """
+                INSERT INTO voiceprints (speaker_id, feature_vector, cluster_count)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE feature_vector=VALUES(feature_vector), cluster_count=VALUES(cluster_count)
+                """
+                cursor.execute(sql, (speaker_id, emb.tobytes(), count))
+                logger.success(f"声纹特征(含计数)保存成功: {speaker_id}, count={count}")
+                return True
+        except Exception as e:
+            logger.fail(f"保存声纹特征(含计数)失败 {speaker_id}: {e}")
+            return False
+
+    def get_voiceprints_with_count(
+        self, speaker_ids: Optional[List[str]] = None
+    ) -> Dict[str, dict]:
+        """
+        获取声纹特征及聚类计数
+
+        Args:
+            speaker_ids: 说话人ID列表
+
+        Returns:
+            Dict[str, dict]: {speaker_id: {"vector": np.ndarray, "count": int}}
+        """
+        try:
+            with db_connection.get_cursor() as cursor:
+                if speaker_ids:
+                    format_strings = ",".join(["%s"] * len(speaker_ids))
+                    sql = f"SELECT speaker_id, feature_vector, COALESCE(cluster_count, 1) FROM voiceprints WHERE speaker_id IN ({format_strings})"
+                    cursor.execute(sql, tuple(speaker_ids))
+                else:
+                    sql = "SELECT speaker_id, feature_vector, COALESCE(cluster_count, 1) FROM voiceprints"
+                    cursor.execute(sql)
+
+                results = cursor.fetchall()
+                voiceprints = {}
+                for row in results:
+                    voiceprints[row[0]] = {
+                        "vector": np.frombuffer(row[1], dtype=np.float32),
+                        "count": int(row[2])
+                    }
+
+                logger.info(f"获取到 {len(voiceprints)} 个声纹特征(含计数)")
+                return voiceprints
+        except Exception as e:
+            logger.error(f"获取声纹特征(含计数)失败: {e}")
+            return {}
+
+    def update_voiceprint_merge(self, speaker_id: str, new_centroid: np.ndarray, new_count: int) -> bool:
+        """
+        合并更新声纹质心和计数（增量聚类用）
+
+        Args:
+            speaker_id: 说话人ID
+            new_centroid: 新的加权合并质心
+            new_count: 新的总计数
+
+        Returns:
+            bool: 操作是否成功
+        """
+        try:
+            with db_connection.get_cursor() as cursor:
+                sql = """
+                UPDATE voiceprints
+                SET feature_vector = %s, cluster_count = %s
+                WHERE speaker_id = %s
+                """
+                cursor.execute(sql, (new_centroid.tobytes(), new_count, speaker_id))
+                if cursor.rowcount > 0:
+                    logger.success(f"声纹质心合并更新成功: {speaker_id}, new_count={new_count}")
+                    return True
+                else:
+                    logger.warning(f"未找到要更新的声纹: {speaker_id}")
+                    return False
+        except Exception as e:
+            logger.fail(f"声纹质心合并更新失败 {speaker_id}: {e}")
+            return False
+
     def count_voiceprints(self) -> int:
         """
         获取声纹特征总数
