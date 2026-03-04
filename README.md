@@ -27,6 +27,7 @@ CREATE TABLE voiceprints (
     id INT AUTO_INCREMENT PRIMARY KEY,
     speaker_id VARCHAR(255) NOT NULL UNIQUE,
     feature_vector LONGBLOB NOT NULL,
+    cluster_count INT DEFAULT 1 COMMENT '聚类音频数量',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_speaker_id (speaker_id)
