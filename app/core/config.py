@@ -100,7 +100,12 @@ class Settings:
     @property
     def cluster_similarity_threshold(self) -> float:
         """聚类相似度阈值"""
-        return self.voiceprint.get("cluster_similarity_threshold", 0.7)
+        return self.voiceprint.get("cluster_similarity_threshold", 0.55)
+
+    @property
+    def cluster_outlier_rescue_ratio(self) -> float:
+        """离群值挽救比例（相对于聚类阈值的倍数，例如0.85表示用85%的阈值尝试归入最近簇）"""
+        return self.voiceprint.get("cluster_outlier_rescue_ratio", 0.85)
 
     @property
     def cluster_max_files(self) -> int:

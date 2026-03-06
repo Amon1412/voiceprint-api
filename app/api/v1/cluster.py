@@ -258,6 +258,7 @@ async def create_upload_cluster_task(
     audio_ids: str = Form(..., description="音频ID列表，JSON数组格式"),
     existing_speaker_ids: Optional[str] = Form(None, description="已有说话人ID列表，JSON数组格式"),
     similarity_threshold: Optional[float] = Form(None, description="聚类相似度阈值"),
+    session_groups: Optional[str] = Form(None, description="session分组映射，JSON对象格式 {sessionId: [audioId, ...]}"),
 ):
     """
     上传音频文件创建增量聚类任务
@@ -299,6 +300,14 @@ async def create_upload_cluster_task(
             except json.JSONDecodeError:
                 raise HTTPException(status_code=400, detail="existing_speaker_ids格式错误")
 
+        # 解析session_groups
+        session_group_map = None
+        if session_groups:
+            try:
+                session_group_map = json.loads(session_groups)
+            except json.JSONDecodeError:
+                logger.warning("session_groups格式错误，将使用普通聚类")
+
         # 读取音频数据
         audio_items = []
         for i, f in enumerate(files):
@@ -312,7 +321,7 @@ async def create_upload_cluster_task(
 
         task_id, total_files, valid_files, invalid_files = (
             cluster_manager.create_task_from_uploads(
-                audio_items, speaker_ids, similarity_threshold
+                audio_items, speaker_ids, similarity_threshold, session_group_map
             )
         )
 

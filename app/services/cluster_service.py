@@ -248,6 +248,7 @@ class ClusterTaskManager:
         audio_items: List[Tuple[str, bytes]],
         existing_speaker_ids: Optional[List[str]] = None,
         similarity_threshold: Optional[float] = None,
+        session_groups: Optional[Dict[str, List[str]]] = None,
     ) -> Tuple[str, int, int, List[dict]]:
         """
         从上传的音频数据创建增量聚类任务（支持已有质心作为锚点）
@@ -256,6 +257,8 @@ class ClusterTaskManager:
             audio_items: [(audio_id, audio_bytes), ...] 音频数据列表
             existing_speaker_ids: 已有说话人ID列表（其质心将作为锚点参与聚类）
             similarity_threshold: 相似度阈值
+            session_groups: session分组映射 {session_id: [audio_id, ...]}，
+                            提供时启用session级预聚合以提升短音频聚类准确性
 
         Returns:
             (task_id, total_files, valid_files, invalid_files_list)
@@ -299,6 +302,7 @@ class ClusterTaskManager:
             "progress_percent": 0.0,
             "similarity_threshold": threshold,
             "existing_centroids": existing_centroids,  # {speaker_id: {"vector": ndarray, "count": int}}
+            "session_groups": session_groups,  # {session_id: [audio_id, ...]} or None
             "error": None,
             "result": None,
             "embeddings": {},  # {index: np.ndarray}
@@ -318,7 +322,8 @@ class ClusterTaskManager:
 
         logger.info(
             f"增量聚类任务已创建: {task_id}, 有效音频: {len(valid_items)}, "
-            f"已有锚点: {len(existing_centroids)}, 阈值: {threshold}"
+            f"已有锚点: {len(existing_centroids)}, 阈值: {threshold}, "
+            f"session分组: {len(session_groups) if session_groups else 0}个"
         )
 
         return task_id, len(audio_items), len(valid_items), invalid_files
@@ -336,6 +341,7 @@ class ClusterTaskManager:
         audio_ids = task["audio_ids"]
         threshold = task["similarity_threshold"]
         existing_centroids = task["existing_centroids"]
+        session_groups = task.get("session_groups")
         embeddings = {}
         valid_indices = []
 
@@ -370,14 +376,31 @@ class ClusterTaskManager:
                     )
                 return
 
-            # 执行带锚点的聚类
-            logger.info(
-                f"开始增量聚类计算: {task_id}, 新向量: {len(valid_indices)}, "
-                f"已有锚点: {len(existing_centroids)}"
+            # 判断是否使用session预聚合模式
+            use_session_agg = (
+                session_groups is not None
+                and len(session_groups) >= 2
             )
-            result = self._cluster_with_anchors(
-                embeddings, valid_indices, audio_ids, threshold, existing_centroids
-            )
+
+            if use_session_agg:
+                logger.info(
+                    f"使用session预聚合模式: {task_id}, "
+                    f"session数: {len(session_groups)}, 新向量: {len(valid_indices)}, "
+                    f"已有锚点: {len(existing_centroids)}"
+                )
+                result = self._cluster_with_session_aggregation(
+                    embeddings, valid_indices, audio_ids, threshold,
+                    existing_centroids, session_groups
+                )
+            else:
+                # 回退到普通聚类
+                logger.info(
+                    f"开始增量聚类计算: {task_id}, 新向量: {len(valid_indices)}, "
+                    f"已有锚点: {len(existing_centroids)}"
+                )
+                result = self._cluster_with_anchors(
+                    embeddings, valid_indices, audio_ids, threshold, existing_centroids
+                )
 
             processing_time = time.time() - start_time
             result["stats"]["processing_time_seconds"] = round(processing_time, 1)
@@ -402,6 +425,292 @@ class ClusterTaskManager:
                 task["status"] = "failed"
                 task["error"] = f"聚类处理异常: {str(e)}"
             logger.error(f"增量聚类任务异常: {task_id}, 错误: {e}")
+
+    def _cluster_with_session_aggregation(
+        self,
+        embeddings: Dict[int, np.ndarray],
+        valid_indices: List[int],
+        audio_ids: List[str],
+        threshold: float,
+        existing_centroids: Dict[str, dict],
+        session_groups: Dict[str, List[str]],
+    ) -> dict:
+        """
+        Session级预聚合聚类算法
+
+        核心思路：
+        1. 将同一session内的音频embedding取平均，生成session级超级样本
+        2. 在session级进行层次聚类（向量更稳定，噪声更小）
+        3. 将聚类结果展开回individual audio ID
+
+        短音频（如"嗯嗯"、"我"等1-3秒片段）单独聚类时embedding不稳定，
+        但同一session内通常是同一说话人，平均后可大幅降噪。
+
+        Args:
+            embeddings: {index: embedding_vector}
+            valid_indices: 有效音频索引
+            audio_ids: 音频ID列表
+            threshold: 相似度阈值
+            existing_centroids: {speaker_id: {"vector": ndarray, "count": int}}
+            session_groups: {session_id: [audio_id, ...]}
+        """
+        # 构建 audio_id → index 映射
+        aid_to_idx = {}
+        for i in valid_indices:
+            aid_to_idx[audio_ids[i]] = i
+
+        # Phase 1: 计算每个session的平均embedding
+        session_embeddings = {}  # {session_id: np.ndarray}
+        session_audio_map = {}   # {session_id: [audio_id, ...]} 仅包含有有效embedding的
+        orphan_indices = []      # 不属于任何session的audio index
+
+        # 收集所有session内有效的audio，决定是否聚合
+        session_assigned = set()  # 被session聚合吸收的audio_id
+        for session_id, session_aids in session_groups.items():
+            valid_embs = []
+            valid_aids = []
+            for aid in session_aids:
+                if aid in aid_to_idx:
+                    idx = aid_to_idx[aid]
+                    if idx in embeddings:
+                        valid_embs.append(embeddings[idx])
+                        valid_aids.append(aid)
+
+            if len(valid_embs) >= 2:
+                # 多条音频的session：计算平均embedding降噪
+                session_centroid = self._compute_centroid(
+                    [e / max(np.linalg.norm(e), 1e-10) for e in valid_embs]
+                )
+                session_embeddings[session_id] = session_centroid
+                session_audio_map[session_id] = valid_aids
+                session_assigned.update(valid_aids)
+            # 仅1条或0条音频的session不聚合，让其作为孤立点参与聚类
+            # （单条音频没有平均降噪收益，保留细粒度信息）
+
+        # 找出不在任何session中的孤立音频
+        for i in valid_indices:
+            aid = audio_ids[i]
+            if aid not in session_assigned:
+                orphan_indices.append(i)
+
+        # 如果session聚合后有效点太少，回退到普通聚类
+        total_cluster_points = len(session_embeddings) + len(orphan_indices)
+        if total_cluster_points < 2:
+            logger.warning(
+                f"Session预聚合后有效点不足({total_cluster_points})，回退到普通聚类"
+            )
+            return self._cluster_with_anchors(
+                embeddings, valid_indices, audio_ids, threshold, existing_centroids
+            )
+
+        logger.info(
+            f"Session预聚合: {len(session_groups)}个session → "
+            f"{len(session_embeddings)}个有效session向量 + "
+            f"{len(orphan_indices)}个孤立音频, "
+            f"总聚类点: {total_cluster_points}"
+        )
+
+        # Phase 2: 构建聚类矩阵 = session向量 + 孤立音频向量 + 锚点向量
+        session_ids_ordered = list(session_embeddings.keys())
+        session_vectors = [session_embeddings[sid] for sid in session_ids_ordered]
+
+        orphan_vectors = []
+        for oi in orphan_indices:
+            emb = embeddings[oi]
+            norm = np.linalg.norm(emb)
+            orphan_vectors.append(emb / max(norm, 1e-10))
+
+        anchor_speaker_ids = list(existing_centroids.keys())
+        anchor_vectors = [existing_centroids[sid]["vector"] for sid in anchor_speaker_ids]
+
+        all_vectors = session_vectors + orphan_vectors + anchor_vectors
+        matrix = np.array(all_vectors, dtype=np.float32)
+
+        n_sessions = len(session_vectors)
+        n_orphans = len(orphan_vectors)
+        n_anchors = len(anchor_vectors)
+
+        # L2 归一化
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        matrix_normalized = matrix / norms
+
+        # 余弦距离矩阵
+        similarity_matrix = np.dot(matrix_normalized, matrix_normalized.T)
+        np.clip(similarity_matrix, -1.0, 1.0, out=similarity_matrix)
+        distance_matrix = 1.0 - similarity_matrix
+        np.fill_diagonal(distance_matrix, 0.0)
+        distance_matrix = np.maximum(distance_matrix, 0.0)
+
+        condensed_dist = squareform(distance_matrix)
+
+        # 层次聚类
+        linkage_matrix = linkage(condensed_dist, method="average")
+        distance_threshold = 1.0 - threshold
+        labels = fcluster(linkage_matrix, t=distance_threshold, criterion="distance")
+
+        # 按标签分组
+        cluster_groups_map: Dict[int, List[int]] = {}
+        for idx, label in enumerate(labels):
+            label = int(label)
+            if label not in cluster_groups_map:
+                cluster_groups_map[label] = []
+            cluster_groups_map[label].append(idx)
+
+        # Phase 3: 构建初始簇 + 离群值挽救
+        n_new = n_sessions + n_orphans  # 新数据点数（不含锚点）
+        initial_clusters = []
+        candidate_outliers = []
+
+        for label in sorted(cluster_groups_map.keys()):
+            group_members = cluster_groups_map[label]
+            new_members = [m for m in group_members if m < n_new]
+            anchor_members = [m for m in group_members if m >= n_new]
+
+            if len(new_members) == 0:
+                continue
+
+            if len(new_members) == 1 and len(anchor_members) == 0:
+                candidate_outliers.append(new_members[0])
+                continue
+
+            initial_clusters.append((label, new_members, anchor_members))
+
+        # 离群值挽救
+        rescue_ratio = settings.cluster_outlier_rescue_ratio
+        rescue_threshold = 1.0 - (threshold * rescue_ratio)
+        final_outliers = []
+
+        if (initial_clusters or anchor_speaker_ids) and candidate_outliers:
+            cluster_centroids = []
+            for _, new_mems, anchor_mems in initial_clusters:
+                all_mems = new_mems + anchor_mems
+                group_embs = [matrix_normalized[m] for m in all_mems]
+                centroid = self._compute_centroid(group_embs)
+                cluster_centroids.append(centroid)
+
+            for outlier_idx in candidate_outliers:
+                outlier_vec = matrix_normalized[outlier_idx]
+                min_dist = float("inf")
+                best_cluster_pos = -1
+
+                for ci, centroid in enumerate(cluster_centroids):
+                    sim = float(np.dot(outlier_vec, centroid))
+                    dist = 1.0 - sim
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_cluster_pos = ci
+
+                if min_dist <= rescue_threshold and best_cluster_pos >= 0:
+                    _, new_mems, anchor_mems = initial_clusters[best_cluster_pos]
+                    new_mems.append(outlier_idx)
+                else:
+                    final_outliers.append(outlier_idx)
+        else:
+            final_outliers = candidate_outliers
+
+        # Phase 4: 展开session级结果回individual audio IDs
+        clusters = []
+        outliers = []
+        cluster_id_counter = 0
+
+        for _, new_members, anchor_members in initial_clusters:
+            # 展开：将session级成员展开为audio_id列表
+            expanded_audio_ids = []
+            for m in new_members:
+                if m < n_sessions:
+                    # 这是一个session聚合点，展开为该session的所有audio_id
+                    sid = session_ids_ordered[m]
+                    expanded_audio_ids.extend(session_audio_map[sid])
+                else:
+                    # 这是一个孤立音频点
+                    orphan_pos = m - n_sessions
+                    orphan_original_idx = orphan_indices[orphan_pos]
+                    expanded_audio_ids.append(audio_ids[orphan_original_idx])
+
+            # 计算该聚类所有individual embedding的质心（用于计算距离）
+            cluster_individual_embs = []
+            for aid in expanded_audio_ids:
+                if aid in aid_to_idx and aid_to_idx[aid] in embeddings:
+                    emb = embeddings[aid_to_idx[aid]]
+                    norm = np.linalg.norm(emb)
+                    cluster_individual_embs.append(emb / max(norm, 1e-10))
+
+            if not cluster_individual_embs:
+                continue
+
+            centroid = self._compute_centroid(cluster_individual_embs)
+
+            # 构建files_info，计算每个audio到质心的距离
+            files_info = []
+            for aid in expanded_audio_ids:
+                if aid in aid_to_idx and aid_to_idx[aid] in embeddings:
+                    emb = embeddings[aid_to_idx[aid]]
+                    norm = np.linalg.norm(emb)
+                    emb_normalized = emb / max(norm, 1e-10)
+                    sim = float(np.dot(emb_normalized, centroid))
+                    distance = round(1.0 - sim, 4)
+                    files_info.append({"audio_id": aid, "distance_to_centroid": distance})
+
+            files_info.sort(key=lambda x: x["distance_to_centroid"])
+
+            cluster_info = {
+                "cluster_id": cluster_id_counter,
+                "file_count": len(files_info),
+                "files": files_info,
+                "existing_speaker_id": None,
+                "existing_speaker_count": None,
+            }
+
+            # 检查是否匹配已有说话人锚点
+            if anchor_members:
+                anchor_idx = anchor_members[0] - n_new
+                matched_speaker_id = anchor_speaker_ids[anchor_idx]
+                matched_count = existing_centroids[matched_speaker_id]["count"]
+                cluster_info["existing_speaker_id"] = matched_speaker_id
+                cluster_info["existing_speaker_count"] = matched_count
+
+            clusters.append(cluster_info)
+            cluster_id_counter += 1
+
+        # 展开离群session/孤立音频
+        for outlier_idx in final_outliers:
+            if outlier_idx < n_sessions:
+                sid = session_ids_ordered[outlier_idx]
+                for aid in session_audio_map[sid]:
+                    outliers.append(aid)
+            else:
+                orphan_pos = outlier_idx - n_sessions
+                orphan_original_idx = orphan_indices[orphan_pos]
+                outliers.append(audio_ids[orphan_original_idx])
+
+        rescued_count = len(candidate_outliers) - len(final_outliers)
+        if rescued_count > 0:
+            logger.info(
+                f"Session聚类离群值挽救: {rescued_count}/{len(candidate_outliers)} 个被归入现有簇"
+            )
+
+        total_audio_in_clusters = sum(c["file_count"] for c in clusters)
+        logger.info(
+            f"Session预聚合聚类完成: {len(clusters)}个簇 "
+            f"(含{total_audio_in_clusters}条音频), "
+            f"{len(outliers)}个离群音频"
+        )
+
+        return {
+            "clusters": clusters,
+            "outliers": outliers,
+            "stats": {
+                "total_files": len(audio_ids),
+                "valid_files": len(valid_indices),
+                "total_clusters": len(clusters),
+                "outlier_count": len(outliers),
+                "rescued_outliers": rescued_count,
+                "session_count": len(session_embeddings),
+                "orphan_count": len(orphan_indices),
+                "processing_time_seconds": 0.0,
+            },
+        }
 
     def _cluster_with_anchors(
         self,
@@ -467,29 +776,68 @@ class ClusterTaskManager:
                 cluster_groups[label] = []
             cluster_groups[label].append(idx)
 
-        # 构建结果
-        clusters = []
-        outliers = []
-        cluster_id_counter = 0
+        # 第一轮：构建初始簇和候选离群值
+        initial_clusters = []  # [(label, [new_members], [anchor_members])]
+        candidate_outliers = []  # [(matrix_index, original_audio_index)]
 
         for label in sorted(cluster_groups.keys()):
             group_members = cluster_groups[label]
-
-            # 分离新音频和锚点
             new_members = [m for m in group_members if m < n_new]
             anchor_members = [m for m in group_members if m >= n_new]
 
             if len(new_members) == 0:
-                # 只有锚点，无新音频加入，跳过
                 continue
 
             if len(new_members) == 1 and len(anchor_members) == 0:
-                # 单独的新音频且无锚点匹配 → 离群点
-                original_idx = indices[new_members[0]]
-                outliers.append(audio_ids[original_idx])
+                candidate_outliers.append(new_members[0])
                 continue
 
-            # 计算新音频到质心的距离
+            initial_clusters.append((label, new_members, anchor_members))
+
+        # 第二轮：离群值挽救 — 尝试将单点归入最近的簇或锚点
+        rescue_ratio = settings.cluster_outlier_rescue_ratio
+        rescue_threshold = 1.0 - (threshold * rescue_ratio)
+        final_outliers = []
+
+        if (initial_clusters or anchor_speaker_ids) and candidate_outliers:
+            # 计算每个簇（含锚点）的质心
+            cluster_centroids = []
+            for _, new_mems, anchor_mems in initial_clusters:
+                all_mems = new_mems + anchor_mems
+                group_embs = [matrix_normalized[m] for m in all_mems]
+                centroid = self._compute_centroid(group_embs)
+                cluster_centroids.append(centroid)
+
+            for outlier_idx in candidate_outliers:
+                outlier_vec = matrix_normalized[outlier_idx]
+                min_dist = float("inf")
+                best_cluster_pos = -1
+
+                for ci, centroid in enumerate(cluster_centroids):
+                    sim = float(np.dot(outlier_vec, centroid))
+                    dist = 1.0 - sim
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_cluster_pos = ci
+
+                if min_dist <= rescue_threshold and best_cluster_pos >= 0:
+                    _, new_mems, anchor_mems = initial_clusters[best_cluster_pos]
+                    new_mems.append(outlier_idx)
+                    logger.debug(
+                        f"锚点聚类离群值已挽救: index={outlier_idx}, "
+                        f"归入簇{best_cluster_pos}, 距离={min_dist:.4f}"
+                    )
+                else:
+                    final_outliers.append(outlier_idx)
+        else:
+            final_outliers = candidate_outliers
+
+        # 第三轮：构建最终结果
+        clusters = []
+        outliers = []
+        cluster_id_counter = 0
+
+        for _, new_members, anchor_members in initial_clusters:
             group_new_embeddings = [matrix_normalized[m] for m in new_members]
             centroid = self._compute_centroid(group_new_embeddings)
 
@@ -511,9 +859,7 @@ class ClusterTaskManager:
                 "existing_speaker_count": None,
             }
 
-            # 检查是否有锚点匹配
             if anchor_members:
-                # 取第一个锚点（通常一个组只有一个锚点）
                 anchor_idx = anchor_members[0] - n_new
                 matched_speaker_id = anchor_speaker_ids[anchor_idx]
                 matched_count = existing_centroids[matched_speaker_id]["count"]
@@ -523,6 +869,16 @@ class ClusterTaskManager:
             clusters.append(cluster_info)
             cluster_id_counter += 1
 
+        for outlier_idx in final_outliers:
+            original_idx = indices[outlier_idx]
+            outliers.append(audio_ids[original_idx])
+
+        rescued_count = len(candidate_outliers) - len(final_outliers)
+        if rescued_count > 0:
+            logger.info(
+                f"锚点聚类离群值挽救完成: {rescued_count}/{len(candidate_outliers)} 个离群点被归入现有簇"
+            )
+
         return {
             "clusters": clusters,
             "outliers": outliers,
@@ -531,6 +887,7 @@ class ClusterTaskManager:
                 "valid_files": len(valid_indices),
                 "total_clusters": len(clusters),
                 "outlier_count": len(outliers),
+                "rescued_outliers": rescued_count,
                 "processing_time_seconds": 0.0,
             },
         }
@@ -862,20 +1219,61 @@ class ClusterTaskManager:
                 cluster_groups[label] = []
             cluster_groups[label].append(idx_in_matrix)
 
-        # 构建结果
+        # 第一轮：构建初始簇和候选离群值
+        initial_clusters = []  # [(label, [indices_in_matrix])]
+        candidate_outliers = []  # [index_in_matrix]
+
+        for label in sorted(cluster_groups.keys()):
+            group_indices_in_matrix = cluster_groups[label]
+            if len(group_indices_in_matrix) == 1:
+                candidate_outliers.append(group_indices_in_matrix[0])
+            else:
+                initial_clusters.append((label, group_indices_in_matrix))
+
+        # 第二轮：离群值挽救 — 尝试将单点归入最近的簇
+        rescue_ratio = settings.cluster_outlier_rescue_ratio
+        rescue_threshold = 1.0 - (threshold * rescue_ratio)  # 更宽松的距离阈值
+        final_outliers = []
+
+        if initial_clusters and candidate_outliers:
+            # 计算每个初始簇的质心
+            cluster_centroids = []
+            for _, group_idx in initial_clusters:
+                group_embs = [matrix_normalized[i] for i in group_idx]
+                centroid = self._compute_centroid(group_embs)
+                cluster_centroids.append(centroid)
+
+            for outlier_idx in candidate_outliers:
+                outlier_vec = matrix_normalized[outlier_idx]
+                # 计算到每个簇质心的距离
+                min_dist = float("inf")
+                best_cluster_pos = -1
+                for ci, centroid in enumerate(cluster_centroids):
+                    sim = float(np.dot(outlier_vec, centroid))
+                    dist = 1.0 - sim
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_cluster_pos = ci
+
+                if min_dist <= rescue_threshold and best_cluster_pos >= 0:
+                    # 归入最近的簇
+                    _, group_idx = initial_clusters[best_cluster_pos]
+                    group_idx.append(outlier_idx)
+                    logger.debug(
+                        f"离群值已挽救: index={outlier_idx}, "
+                        f"归入簇{best_cluster_pos}, 距离={min_dist:.4f}"
+                    )
+                else:
+                    final_outliers.append(outlier_idx)
+        else:
+            final_outliers = candidate_outliers
+
+        # 第三轮：构建最终结果
         clusters = []
         outliers = []
         cluster_id_counter = 0
 
-        for label in sorted(cluster_groups.keys()):
-            group_indices_in_matrix = cluster_groups[label]
-
-            if len(group_indices_in_matrix) == 1:
-                # 单文件聚类 → 离群点
-                original_idx = indices[group_indices_in_matrix[0]]
-                outliers.append({"file_path": file_paths[original_idx]})
-                continue
-
+        for _, group_indices_in_matrix in initial_clusters:
             # 计算质心
             group_embeddings = [
                 matrix_normalized[i] for i in group_indices_in_matrix
@@ -890,7 +1288,6 @@ class ClusterTaskManager:
             for idx_in_matrix in group_indices_in_matrix:
                 original_idx = indices[idx_in_matrix]
                 fp = file_paths[original_idx]
-                # 到质心的余弦距离
                 sim = float(
                     np.dot(matrix_normalized[idx_in_matrix], centroid)
                 )
@@ -904,7 +1301,6 @@ class ClusterTaskManager:
                     min_distance = distance
                     centroid_file = fp
 
-            # 按距离排序
             files_info.sort(key=lambda x: x["distance_to_centroid"])
 
             clusters.append(
@@ -917,6 +1313,16 @@ class ClusterTaskManager:
             )
             cluster_id_counter += 1
 
+        for outlier_idx in final_outliers:
+            original_idx = indices[outlier_idx]
+            outliers.append({"file_path": file_paths[original_idx]})
+
+        rescued_count = len(candidate_outliers) - len(final_outliers)
+        if rescued_count > 0:
+            logger.info(
+                f"离群值挽救完成: {rescued_count}/{len(candidate_outliers)} 个离群点被归入现有簇"
+            )
+
         return {
             "clusters": clusters,
             "outliers": outliers,
@@ -925,7 +1331,8 @@ class ClusterTaskManager:
                 "valid_files": len(valid_indices),
                 "total_clusters": len(clusters),
                 "outlier_count": len(outliers),
-                "processing_time_seconds": 0.0,  # 由调用者填充
+                "rescued_outliers": rescued_count,
+                "processing_time_seconds": 0.0,
             },
         }
 
