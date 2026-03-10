@@ -33,9 +33,8 @@ class ClusterTaskManager:
 
     def _periodic_cleanup(self) -> None:
         """后台定期清理过期任务"""
-        import time as _time
         while True:
-            _time.sleep(3600)  # 每小时执行一次
+            time.sleep(3600)  # 每小时执行一次
             try:
                 self._cleanup_stale_tasks()
             except Exception as e:

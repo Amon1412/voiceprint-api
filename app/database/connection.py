@@ -1,4 +1,5 @@
 import pymysql
+import threading
 from typing import Optional
 from contextlib import contextmanager
 from ..core.config import settings
@@ -12,6 +13,7 @@ class DatabaseConnection:
 
     def __init__(self):
         self._connection: Optional[pymysql.Connection] = None
+        self._lock = threading.Lock()  # pymysql连接非线程安全，需要锁保护
         self._connect()
 
     def _connect(self) -> None:
@@ -56,37 +58,36 @@ class DatabaseConnection:
 
     @contextmanager
     def get_cursor(self):
-        """获取数据库游标的上下文管理器（带自动重连）"""
-        self._ensure_connection()
+        """获取数据库游标的上下文管理器（带自动重连和线程安全）"""
+        with self._lock:
+            self._ensure_connection()
 
-        cursor = None
-        try:
-            cursor = self._connection.cursor()
-            yield cursor
-        except pymysql.OperationalError as e:
-            # 连接级错误（如服务端断开），重连后重试一次
-            error_code = e.args[0] if e.args else 0
-            if error_code in (2006, 2013, 2014, 0):  # MySQL server has gone away / Lost connection
-                logger.warning(f"数据库连接丢失(错误码{error_code})，重连重试...")
+            cursor = None
+            try:
+                cursor = self._connection.cursor()
+                yield cursor
+            except pymysql.OperationalError as e:
+                # 连接级错误（如服务端断开），重连以便下次调用可用
+                error_code = e.args[0] if e.args else 0
+                if error_code in (2006, 2013, 2014, 0):  # MySQL server has gone away / Lost connection
+                    logger.warning(f"数据库连接丢失(错误码{error_code})，标记重连...")
+                    if cursor:
+                        cursor.close()
+                        cursor = None
+                    self._connection = None
+                    # 重连以便下次调用可用（当前yield已执行，无法重试SQL）
+                    self._connect()
+                if self._connection and self._connection.open:
+                    self._connection.rollback()
+                raise
+            except Exception as e:
+                logger.fail(f"数据库操作失败: {e}")
+                if self._connection and self._connection.open:
+                    self._connection.rollback()
+                raise
+            finally:
                 if cursor:
                     cursor.close()
-                    cursor = None
-                self._connection = None
-                self._connect()
-                cursor = self._connection.cursor()
-                # 注意：这里不能自动重试SQL，因为yield已经执行
-                # 抛出异常让调用方重试
-            if self._connection:
-                self._connection.rollback()
-            raise
-        except Exception as e:
-            logger.fail(f"数据库操作失败: {e}")
-            if self._connection:
-                self._connection.rollback()
-            raise
-        finally:
-            if cursor:
-                cursor.close()
 
     def close(self) -> None:
         """关闭数据库连接"""
