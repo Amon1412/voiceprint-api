@@ -19,6 +19,8 @@ class AudioProcessor:
         self.tmp_dir = settings.tmp_dir
         # 确保临时目录存在
         os.makedirs(self.tmp_dir, exist_ok=True)
+        # 启动时清理上次残留的临时文件（进程异常退出时未清理的）
+        self._cleanup_stale_files()
 
     def ensure_16k_wav(self, audio_bytes: bytes) -> str:
         """
@@ -151,6 +153,20 @@ class AudioProcessor:
             # 清理临时文件
             if "tmp_path" in locals() and os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def _cleanup_stale_files(self) -> None:
+        """启动时清理临时目录中的残留文件"""
+        try:
+            count = 0
+            for f in os.listdir(self.tmp_dir):
+                fp = os.path.join(self.tmp_dir, f)
+                if os.path.isfile(fp) and f.endswith(".wav"):
+                    os.remove(fp)
+                    count += 1
+            if count > 0:
+                logger.info(f"已清理{count}个残留临时文件")
+        except Exception as e:
+            logger.warning(f"清理残留临时文件失败: {e}")
 
     def cleanup_temp_file(self, file_path: str) -> None:
         """

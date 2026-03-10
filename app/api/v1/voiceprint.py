@@ -1,6 +1,7 @@
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Depends
 from fastapi.security import HTTPBearer
 from typing import List
+import asyncio
 import time
 from ...models.voiceprint import VoiceprintRegisterResponse, VoiceprintRegisterMultiResponse, VoiceprintIdentifyResponse
 from ...services.voiceprint_service import voiceprint_service
@@ -46,8 +47,8 @@ async def register_voiceprint(
         # 读取音频数据
         audio_bytes = await file.read()
 
-        # 注册声纹
-        success = voiceprint_service.register_voiceprint(speaker_id, audio_bytes)
+        # 注册声纹（CPU密集型ML推理，放到线程池避免阻塞事件循环）
+        success = await asyncio.to_thread(voiceprint_service.register_voiceprint, speaker_id, audio_bytes)
 
         if success:
             return VoiceprintRegisterResponse(success=True, msg=f"已登记: {speaker_id}")
@@ -113,11 +114,11 @@ async def identify_voiceprint(
             f"音频文件读取完成，大小: {len(audio_bytes)}字节，耗时: {read_time:.3f}秒"
         )
 
-        # 识别声纹
+        # 识别声纹（CPU密集型ML推理，放到线程池避免阻塞事件循环）
         identify_start = time.time()
         logger.info("开始调用声纹识别服务...")
-        match_name, match_score = voiceprint_service.identify_voiceprint(
-            candidate_ids, audio_bytes
+        match_name, match_score = await asyncio.to_thread(
+            voiceprint_service.identify_voiceprint, candidate_ids, audio_bytes
         )
         identify_time = time.time() - identify_start
         logger.info(f"声纹识别服务调用完成，耗时: {identify_time:.3f}秒")
@@ -164,7 +165,7 @@ async def register_voiceprint_multi(
             audio_bytes = await f.read()
             audio_bytes_list.append(audio_bytes)
 
-        success, count = voiceprint_service.register_voiceprint_multi(speaker_id, audio_bytes_list)
+        success, count = await asyncio.to_thread(voiceprint_service.register_voiceprint_multi, speaker_id, audio_bytes_list)
 
         if success:
             return VoiceprintRegisterMultiResponse(

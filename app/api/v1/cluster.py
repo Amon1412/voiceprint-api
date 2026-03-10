@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
 from fastapi.security import HTTPBearer
+import asyncio
 import time
 import json
 from typing import List, Optional
@@ -78,7 +79,8 @@ async def create_cluster_task(
             )
 
         task_id, total_files, valid_files, invalid_files = (
-            cluster_manager.create_task(
+            await asyncio.to_thread(
+                cluster_manager.create_task,
                 request.file_paths, request.similarity_threshold
             )
         )
@@ -207,7 +209,8 @@ async def confirm_clusters(
     )
 
     try:
-        result = cluster_manager.confirm_clusters(
+        result = await asyncio.to_thread(
+            cluster_manager.confirm_clusters,
             task_id,
             [a.dict() for a in request.assignments],
         )
@@ -320,7 +323,8 @@ async def create_upload_cluster_task(
         )
 
         task_id, total_files, valid_files, invalid_files = (
-            cluster_manager.create_task_from_uploads(
+            await asyncio.to_thread(
+                cluster_manager.create_task_from_uploads,
                 audio_items, speaker_ids, similarity_threshold, session_group_map
             )
         )
@@ -417,7 +421,8 @@ async def confirm_upload_clusters(
     )
 
     try:
-        result = cluster_manager.confirm_clusters_merge(
+        result = await asyncio.to_thread(
+            cluster_manager.confirm_clusters_merge,
             task_id,
             [a.dict() for a in request.assignments],
         )

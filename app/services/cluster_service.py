@@ -24,7 +24,22 @@ class ClusterTaskManager:
     def __init__(self):
         self._tasks: Dict[str, dict] = {}
         self._lock = threading.Lock()
+        # 启动后台定期清理线程（每小时清理一次过期任务，防止内存泄漏）
+        self._cleanup_thread = threading.Thread(
+            target=self._periodic_cleanup, daemon=True
+        )
+        self._cleanup_thread.start()
         logger.info("聚类任务管理器初始化完成")
+
+    def _periodic_cleanup(self) -> None:
+        """后台定期清理过期任务"""
+        import time as _time
+        while True:
+            _time.sleep(3600)  # 每小时执行一次
+            try:
+                self._cleanup_stale_tasks()
+            except Exception as e:
+                logger.warning(f"定期清理聚类任务失败: {e}")
 
     def create_task(
         self,
