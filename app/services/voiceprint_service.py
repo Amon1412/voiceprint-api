@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import time
+import os
 import threading
 from typing import Dict, List, Tuple
 from modelscope.pipelines import pipeline
@@ -133,6 +134,18 @@ class VoiceprintService:
         """
         return x.cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
 
+    @staticmethod
+    def _get_rss_mb() -> int:
+        """读取当前进程RSS内存(MB)，用于OOM诊断"""
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) // 1024
+        except Exception:
+            pass
+        return -1
+
     def extract_voiceprint(self, audio_path: str) -> np.ndarray:
         """
         从音频文件中提取声纹特征
@@ -144,7 +157,10 @@ class VoiceprintService:
             np.ndarray: 声纹特征向量
         """
         start_time = time.time()
-        logger.start(f"提取声纹特征，音频文件: {audio_path}")
+        # 记录音频文件大小和进程内存，用于OOM诊断
+        file_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+        mem_mb = self._get_rss_mb()
+        logger.start(f"提取声纹特征，音频文件: {audio_path}，文件大小: {file_size}字节，进程RSS: {mem_mb}MB")
 
         try:
             # 使用线程锁确保模型推理的线程安全
@@ -166,7 +182,8 @@ class VoiceprintService:
             logger.debug(f"数据转换完成，耗时: {convert_time:.3f}秒")
 
             total_time = time.time() - start_time
-            logger.complete(f"提取声纹特征，维度: {emb.shape}", total_time)
+            mem_after = self._get_rss_mb()
+            logger.complete(f"提取声纹特征，维度: {emb.shape}，推理后RSS: {mem_after}MB", total_time)
             return emb
         except Exception as e:
             total_time = time.time() - start_time
@@ -296,9 +313,13 @@ class VoiceprintService:
 
         audio_path = None
         try:
-            # 简化音频验证
+            # 音频大小验证
             if len(audio_bytes) < 1000:
                 logger.warning("音频文件过小")
+                return "", 0.0
+            max_size = 5 * 1024 * 1024  # 5MB
+            if len(audio_bytes) > max_size:
+                logger.warning(f"音频文件过大: {len(audio_bytes)}字节，超过{max_size}字节限制")
                 return "", 0.0
 
             # 处理音频文件

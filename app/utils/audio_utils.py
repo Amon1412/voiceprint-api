@@ -46,9 +46,22 @@ class AudioProcessor:
             read_start = time.time()
             data, sr = sf.read(tmp_path)
             read_time = time.time() - read_start
+            duration = len(data) / sr if sr > 0 else 0
             logger.debug(
-                f"音频文件读取完成，采样率: {sr}Hz，时长: {len(data)/sr:.2f}秒，耗时: {read_time:.3f}秒"
+                f"音频文件读取完成，采样率: {sr}Hz，时长: {duration:.2f}秒，耗时: {read_time:.3f}秒"
             )
+
+            # 截断过长音频，防止大文件导致OOM
+            max_duration = 30  # 秒
+            if duration > max_duration:
+                max_samples = int(max_duration * sr)
+                if data.ndim == 1:
+                    data = data[:max_samples]
+                else:
+                    data = data[:max_samples, :]
+                logger.warning(f"音频时长 {duration:.1f}秒 超过限制，已截断至 {max_duration}秒")
+                # 写回截断后的音频
+                sf.write(tmp_path, data, sr)
 
             if sr != self.target_sample_rate:
                 # librosa重采样，支持多通道
