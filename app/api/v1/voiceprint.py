@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer
 from typing import List
 import asyncio
 import time
-from ...models.voiceprint import VoiceprintRegisterResponse, VoiceprintRegisterMultiResponse, VoiceprintIdentifyResponse
+from ...models.voiceprint import VoiceprintRegisterResponse, VoiceprintRegisterMultiResponse, VoiceprintIdentifyResponse, VoiceprintBatchIdentifyItem, VoiceprintBatchIdentifyResponse
 from ...services.voiceprint_service import voiceprint_service
 from ...api.dependencies import AuthorizationToken
 from ...core.logger import get_logger
@@ -138,6 +138,66 @@ async def identify_voiceprint(
         total_time = time.time() - start_time
         logger.error(f"声纹识别异常，总耗时: {total_time:.3f}秒，错误: {e}")
         raise HTTPException(status_code=500, detail=f"声纹识别失败: {str(e)}")
+
+
+@router.post(
+    "/identify-batch",
+    summary="批量声纹识别",
+    response_model=VoiceprintBatchIdentifyResponse,
+    description="批量识别多个音频文件中的说话人，一次加载候选声纹减少DB开销",
+    dependencies=[Depends(security)],
+)
+async def identify_voiceprint_batch(
+    token: AuthorizationToken,
+    speaker_ids: str = Form(..., description="候选说话人ID，逗号分隔"),
+    files: List[UploadFile] = File(..., description="WAV音频文件列表，最多10个"),
+):
+    start_time = time.time()
+    logger.info(
+        f"开始批量声纹识别请求 - 候选说话人: {speaker_ids}, 文件数: {len(files)}"
+    )
+
+    try:
+        if len(files) < 1:
+            raise HTTPException(status_code=400, detail="至少需要1个音频文件")
+        if len(files) > 10:
+            raise HTTPException(status_code=400, detail="最多支持10个音频文件")
+
+        candidate_ids = [x.strip() for x in speaker_ids.split(",") if x.strip()]
+        if not candidate_ids:
+            raise HTTPException(status_code=400, detail="候选说话人ID不能为空")
+
+        audio_bytes_list = []
+        for f in files:
+            if not f.filename or not f.filename.lower().endswith(".wav"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"只支持WAV格式音频文件，文件 '{f.filename}' 格式不正确",
+                )
+            audio_bytes = await f.read()
+            audio_bytes_list.append(audio_bytes)
+
+        results = await asyncio.to_thread(
+            voiceprint_service.identify_voiceprint_batch,
+            candidate_ids,
+            audio_bytes_list,
+        )
+
+        total_time = time.time() - start_time
+        logger.info(
+            f"批量声纹识别请求完成，总耗时: {total_time:.3f}秒，处理{len(files)}个文件"
+        )
+
+        return VoiceprintBatchIdentifyResponse(
+            results=[VoiceprintBatchIdentifyItem(**r) for r in results]
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        total_time = time.time() - start_time
+        logger.error(f"批量声纹识别异常，总耗时: {total_time:.3f}秒，错误: {e}")
+        raise HTTPException(status_code=500, detail=f"批量声纹识别失败: {str(e)}")
 
 
 @router.post(

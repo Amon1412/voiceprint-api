@@ -394,6 +394,78 @@ class VoiceprintService:
             cleanup_time = time.time() - cleanup_start
             logger.debug(f"临时文件清理完成，耗时: {cleanup_time:.3f}秒")
 
+    def identify_voiceprint_batch(
+        self, speaker_ids: List[str], audio_bytes_list: List[bytes]
+    ) -> List[dict]:
+        """
+        批量声纹识别：一次加载候选声纹，逐条处理多个音频
+
+        Args:
+            speaker_ids: 候选说话人ID列表
+            audio_bytes_list: 音频字节数据列表
+
+        Returns:
+            List[dict]: 每条音频的识别结果 [{index, speaker_id, score}]
+        """
+        start_time = time.time()
+        logger.info(
+            f"开始批量声纹识别，候选说话人: {len(speaker_ids)}，音频数量: {len(audio_bytes_list)}"
+        )
+
+        # 一次性加载所有候选声纹向量
+        voiceprints = voiceprint_db.get_voiceprints(speaker_ids)
+        if not voiceprints:
+            logger.info("未找到候选说话人声纹")
+            return [
+                {"index": i, "speaker_id": "", "score": 0.0}
+                for i in range(len(audio_bytes_list))
+            ]
+
+        results = []
+        for i, audio_bytes in enumerate(audio_bytes_list):
+            audio_path = None
+            try:
+                if len(audio_bytes) < 1000:
+                    logger.warning(f"批量识别[{i}]: 音频文件过小")
+                    results.append({"index": i, "speaker_id": "", "score": 0.0})
+                    continue
+                max_size = 5 * 1024 * 1024
+                if len(audio_bytes) > max_size:
+                    logger.warning(f"批量识别[{i}]: 音频文件过大 {len(audio_bytes)}字节")
+                    results.append({"index": i, "speaker_id": "", "score": 0.0})
+                    continue
+
+                audio_path = audio_processor.ensure_16k_wav(audio_bytes)
+                test_emb = self.extract_voiceprint(audio_path)
+
+                # 与预加载的候选向量比对
+                best_name = ""
+                best_score = 0.0
+                for name, emb in voiceprints.items():
+                    similarity = self.calculate_similarity(test_emb, emb)
+                    if similarity > best_score:
+                        best_score = similarity
+                        best_name = name
+
+                results.append(
+                    {"index": i, "speaker_id": best_name, "score": float(best_score)}
+                )
+                logger.debug(
+                    f"批量识别[{i}]: 最佳匹配={best_name}, 分数={best_score:.4f}"
+                )
+            except Exception as e:
+                logger.warning(f"批量识别[{i}]异常: {e}")
+                results.append({"index": i, "speaker_id": "", "score": 0.0})
+            finally:
+                if audio_path:
+                    audio_processor.cleanup_temp_file(audio_path)
+
+        total_time = time.time() - start_time
+        logger.info(
+            f"批量声纹识别完成，处理{len(audio_bytes_list)}条，总耗时: {total_time:.3f}秒"
+        )
+        return results
+
     def delete_voiceprint(self, speaker_id: str) -> bool:
         """
         删除声纹

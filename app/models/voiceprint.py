@@ -49,3 +49,17 @@ class VoiceprintIdentifyResponse(BaseModel):
 
     class Config:
         schema_extra = {"example": {"speaker_id": "user_001", "score": 0.85}}
+
+
+class VoiceprintBatchIdentifyItem(BaseModel):
+    """批量识别单条结果"""
+
+    index: int
+    speaker_id: str
+    score: float
+
+
+class VoiceprintBatchIdentifyResponse(BaseModel):
+    """批量声纹识别响应模型"""
+
+    results: List[VoiceprintBatchIdentifyItem]
