@@ -6,9 +6,11 @@ from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
 
 from .api.v1.api import api_router
-from loguru import logger
+from .core.logger import get_logger
 from .core.version import VERSION
 import time
+
+logger = get_logger(__name__)
 
 
 def create_app() -> FastAPI:
