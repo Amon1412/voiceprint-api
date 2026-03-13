@@ -35,6 +35,21 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # 请求日志中间件 - 记录所有传入请求
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        start = time.time()
+        logger.info(f"📥 请求: {request.method} {request.url.path}")
+        try:
+            response = await call_next(request)
+            elapsed = time.time() - start
+            logger.info(f"📤 响应: {request.method} {request.url.path} → {response.status_code} ({elapsed:.3f}秒)")
+            return response
+        except Exception as e:
+            elapsed = time.time() - start
+            logger.error(f"💥 请求异常: {request.method} {request.url.path} → {type(e).__name__}: {e} ({elapsed:.3f}秒)")
+            raise
+
     # 注册API路由
     app.include_router(api_router, prefix="/voiceprint")
 
