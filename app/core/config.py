@@ -85,7 +85,7 @@ class Settings:
     @property
     def similarity_threshold(self) -> float:
         """声纹相似度阈值"""
-        return self.voiceprint.get("similarity_threshold", 0.2)
+        return self.voiceprint.get("similarity_threshold", 0.45)
 
     @property
     def target_sample_rate(self) -> int:

@@ -190,6 +190,61 @@ class VoiceprintService:
             logger.fail(f"声纹特征提取失败，总耗时: {total_time:.3f}秒，错误: {e}")
             raise
 
+    def extract_voiceprint_batch(self, audio_paths: List[str], batch_size: int = 10) -> List[np.ndarray]:
+        """
+        批量提取声纹特征，利用 ModelScope pipeline 的批量推理能力
+
+        Args:
+            audio_paths: 音频文件路径列表
+            batch_size: 每批推理的音频数量，避免单次占用过多内存
+
+        Returns:
+            List[np.ndarray]: 声纹特征向量列表
+        """
+        if not audio_paths:
+            return []
+
+        start_time = time.time()
+        all_embeddings = []
+
+        for i in range(0, len(audio_paths), batch_size):
+            batch_paths = audio_paths[i:i + batch_size]
+            batch_start = time.time()
+
+            with self._pipeline_lock:
+                if self._pipeline is None:
+                    raise RuntimeError("声纹模型未初始化")
+                result = self._pipeline(batch_paths, output_emb=True)
+
+            batch_embs = [self._to_numpy(emb).astype(np.float32) for emb in result["embs"]]
+            all_embeddings.extend(batch_embs)
+
+            batch_time = time.time() - batch_start
+            logger.debug(f"批量推理[{i}:{i+len(batch_paths)}] 完成，耗时: {batch_time:.3f}秒")
+
+        total_time = time.time() - start_time
+        logger.info(f"批量提取声纹特征完成，共{len(audio_paths)}条，总耗时: {total_time:.3f}秒")
+        return all_embeddings
+
+    def calculate_similarity_matrix(self, test_embs: np.ndarray, candidate_embs: np.ndarray) -> np.ndarray:
+        """
+        批量计算相似度矩阵，使用矩阵乘法替代逐对循环
+
+        Args:
+            test_embs: [M, D] M条测试音频的embedding
+            candidate_embs: [N, D] N个候选声纹的embedding
+
+        Returns:
+            np.ndarray: [M, N] 相似度矩阵
+        """
+        # L2 归一化
+        test_norms = np.linalg.norm(test_embs, axis=1, keepdims=True)
+        cand_norms = np.linalg.norm(candidate_embs, axis=1, keepdims=True)
+        test_normalized = test_embs / np.maximum(test_norms, 1e-8)
+        cand_normalized = candidate_embs / np.maximum(cand_norms, 1e-8)
+        # 矩阵乘法一次计算所有余弦相似度
+        return test_normalized @ cand_normalized.T
+
     def calculate_similarity(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
         """
         计算两个声纹特征的相似度
@@ -229,8 +284,8 @@ class VoiceprintService:
                 logger.warning(f"音频文件过小: {speaker_id}")
                 return False
 
-            # 处理音频文件
-            audio_path = audio_processor.ensure_16k_wav(audio_bytes)
+            # 处理音频文件（注册时不降噪，保留原始声纹特征）
+            audio_path = audio_processor.ensure_16k_wav(audio_bytes, apply_denoise=False)
 
             # 提取声纹特征
             emb = self.extract_voiceprint(audio_path)
@@ -271,7 +326,7 @@ class VoiceprintService:
                 if len(audio_bytes) < 1000:
                     logger.warning(f"音频文件{i}过小，跳过")
                     continue
-                audio_path = audio_processor.ensure_16k_wav(audio_bytes)
+                audio_path = audio_processor.ensure_16k_wav(audio_bytes, apply_denoise=False)
                 emb = self.extract_voiceprint(audio_path)
                 embeddings.append(emb)
             except Exception as e:
@@ -294,6 +349,26 @@ class VoiceprintService:
         if success:
             logger.info(f"多文件声纹注册成功: {speaker_id}, 使用{len(embeddings)}个embedding")
         return success, len(embeddings)
+
+    def _check_audio_quality(self, audio_bytes: bytes) -> Dict:
+        """
+        对原始音频字节进行质量预检（内存读取，不写磁盘）
+
+        Args:
+            audio_bytes: 原始音频字节
+
+        Returns:
+            dict: 质量指标
+        """
+        import io
+        import soundfile as sf
+        try:
+            buf = io.BytesIO(audio_bytes)
+            data, sr = sf.read(buf)
+            return audio_processor.check_audio_quality(data, sr)
+        except Exception as e:
+            logger.warning(f"音频质量预检失败: {e}")
+            return {"ok": True, "reason": ""}  # 预检失败不阻断流程
 
     def identify_voiceprint(
         self, speaker_ids: List[str], audio_bytes: bytes
@@ -322,7 +397,15 @@ class VoiceprintService:
                 logger.warning(f"音频文件过大: {len(audio_bytes)}字节，超过{max_size}字节限制")
                 return "", 0.0
 
-            # 处理音频文件
+            # 音频质量预检
+            quality = self._check_audio_quality(audio_bytes)
+            if not quality["ok"]:
+                logger.warning(f"音频质量预检不通过: {quality['reason']}，跳过识别")
+                return "", 0.0
+            if quality.get("snr_db", 60) < 10:
+                logger.info(f"音频信噪比较低: {quality.get('snr_db', 0):.1f}dB，识别结果可能不可靠")
+
+            # 处理音频文件（含降噪）
             audio_process_start = time.time()
             audio_path = audio_processor.ensure_16k_wav(audio_bytes)
             audio_process_time = time.time() - audio_process_start
@@ -348,24 +431,22 @@ class VoiceprintService:
                 logger.info("未找到候选说话人声纹")
                 return "", 0.0
 
-            # 计算相似度
+            # 向量化计算相似度
             similarity_start = time.time()
             logger.debug("开始计算相似度...")
-            similarities = {}
-            for name, emb in voiceprints.items():
-                similarity = self.calculate_similarity(test_emb, emb)
-                similarities[name] = similarity
+            candidate_names = list(voiceprints.keys())
+            candidate_embs = np.stack(list(voiceprints.values()))
+            test_emb_2d = test_emb.reshape(1, -1)
+            sim_scores = self.calculate_similarity_matrix(test_emb_2d, candidate_embs)[0]  # [N]
             similarity_time = time.time() - similarity_start
             logger.debug(
-                f"相似度计算完成，共计算{len(similarities)}个，耗时: {similarity_time:.3f}秒"
+                f"相似度计算完成，共计算{len(candidate_names)}个，耗时: {similarity_time:.3f}秒"
             )
 
             # 找到最佳匹配
-            if not similarities:
-                return "", 0.0
-
-            match_name = max(similarities, key=similarities.get)
-            match_score = similarities[match_name]
+            best_idx = int(np.argmax(sim_scores))
+            match_name = candidate_names[best_idx]
+            match_score = float(sim_scores[best_idx])
 
             # 检查是否超过阈值
             if match_score < self.similarity_threshold:
@@ -398,7 +479,7 @@ class VoiceprintService:
         self, speaker_ids: List[str], audio_bytes_list: List[bytes]
     ) -> List[dict]:
         """
-        批量声纹识别：一次加载候选声纹，逐条处理多个音频
+        批量声纹识别：真正的批量推理 + 向量化相似度计算
 
         Args:
             speaker_ids: 候选说话人ID列表
@@ -421,48 +502,86 @@ class VoiceprintService:
                 for i in range(len(audio_bytes_list))
             ]
 
-        results = []
+        # 构建候选矩阵 [N, D] 和名称映射
+        candidate_names = list(voiceprints.keys())
+        candidate_embs = np.stack(list(voiceprints.values()))
+
+        # 阶段1：预处理所有音频，收集有效路径
+        valid_indices = []  # 原始索引
+        audio_paths = []
+        results = [None] * len(audio_bytes_list)
+
+        preprocess_start = time.time()
         for i, audio_bytes in enumerate(audio_bytes_list):
-            audio_path = None
             try:
                 if len(audio_bytes) < 1000:
                     logger.warning(f"批量识别[{i}]: 音频文件过小")
-                    results.append({"index": i, "speaker_id": "", "score": 0.0})
+                    results[i] = {"index": i, "speaker_id": "", "score": 0.0}
                     continue
                 max_size = 5 * 1024 * 1024
                 if len(audio_bytes) > max_size:
                     logger.warning(f"批量识别[{i}]: 音频文件过大 {len(audio_bytes)}字节")
-                    results.append({"index": i, "speaker_id": "", "score": 0.0})
+                    results[i] = {"index": i, "speaker_id": "", "score": 0.0}
                     continue
 
                 audio_path = audio_processor.ensure_16k_wav(audio_bytes)
-                test_emb = self.extract_voiceprint(audio_path)
-
-                # 与预加载的候选向量比对
-                best_name = ""
-                best_score = 0.0
-                for name, emb in voiceprints.items():
-                    similarity = self.calculate_similarity(test_emb, emb)
-                    if similarity > best_score:
-                        best_score = similarity
-                        best_name = name
-
-                results.append(
-                    {"index": i, "speaker_id": best_name, "score": float(best_score)}
-                )
-                logger.debug(
-                    f"批量识别[{i}]: 最佳匹配={best_name}, 分数={best_score:.4f}"
-                )
+                audio_paths.append(audio_path)
+                valid_indices.append(i)
             except Exception as e:
-                logger.warning(f"批量识别[{i}]异常: {e}")
-                results.append({"index": i, "speaker_id": "", "score": 0.0})
-            finally:
-                if audio_path:
-                    audio_processor.cleanup_temp_file(audio_path)
+                logger.warning(f"批量识别[{i}]音频预处理异常: {e}")
+                results[i] = {"index": i, "speaker_id": "", "score": 0.0}
+
+        preprocess_time = time.time() - preprocess_start
+        logger.debug(f"音频预处理完成，有效{len(audio_paths)}条，耗时: {preprocess_time:.3f}秒")
+
+        try:
+            if audio_paths:
+                # 阶段2：批量推理提取所有embedding
+                extract_start = time.time()
+                test_embs_list = self.extract_voiceprint_batch(audio_paths)
+                extract_time = time.time() - extract_start
+                logger.debug(f"批量特征提取完成，耗时: {extract_time:.3f}秒")
+
+                # 阶段3：向量化相似度计算
+                similarity_start = time.time()
+                test_embs = np.stack(test_embs_list)  # [M, D]
+                sim_matrix = self.calculate_similarity_matrix(test_embs, candidate_embs)  # [M, N]
+
+                best_indices = np.argmax(sim_matrix, axis=1)  # [M]
+                best_scores = sim_matrix[np.arange(len(best_indices)), best_indices]  # [M]
+                similarity_time = time.time() - similarity_start
+                logger.debug(f"向量化相似度计算完成，耗时: {similarity_time:.3f}秒")
+
+                # 填充结果
+                for j, orig_idx in enumerate(valid_indices):
+                    best_name = candidate_names[best_indices[j]]
+                    best_score = float(best_scores[j])
+                    results[orig_idx] = {
+                        "index": orig_idx,
+                        "speaker_id": best_name,
+                        "score": best_score,
+                    }
+                    logger.debug(
+                        f"批量识别[{orig_idx}]: 最佳匹配={best_name}, 分数={best_score:.4f}"
+                    )
+        except Exception as e:
+            logger.error(f"批量推理/相似度计算异常: {e}")
+            for j, orig_idx in enumerate(valid_indices):
+                if results[orig_idx] is None:
+                    results[orig_idx] = {"index": orig_idx, "speaker_id": "", "score": 0.0}
+        finally:
+            # 清理所有临时文件
+            for audio_path in audio_paths:
+                audio_processor.cleanup_temp_file(audio_path)
+
+        # 填充未处理的结果（防御性）
+        for i in range(len(results)):
+            if results[i] is None:
+                results[i] = {"index": i, "speaker_id": "", "score": 0.0}
 
         total_time = time.time() - start_time
         logger.info(
-            f"批量声纹识别完成，处理{len(audio_bytes_list)}条，总耗时: {total_time:.3f}秒"
+            f"批量声纹识别完成，处理{len(audio_bytes_list)}条(有效{len(audio_paths)}条)，总耗时: {total_time:.3f}秒"
         )
         return results
 
