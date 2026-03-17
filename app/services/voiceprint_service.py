@@ -405,9 +405,9 @@ class VoiceprintService:
             if quality.get("snr_db", 60) < 10:
                 logger.info(f"音频信噪比较低: {quality.get('snr_db', 0):.1f}dB，识别结果可能不可靠")
 
-            # 处理音频文件（含降噪）
+            # 处理音频文件（小智服务端已做降噪，此处跳过避免重复降噪）
             audio_process_start = time.time()
-            audio_path = audio_processor.ensure_16k_wav(audio_bytes)
+            audio_path = audio_processor.ensure_16k_wav(audio_bytes, apply_denoise=False)
             audio_process_time = time.time() - audio_process_start
             logger.debug(f"音频文件处理完成，耗时: {audio_process_time:.3f}秒")
 
@@ -524,7 +524,7 @@ class VoiceprintService:
                     results[i] = {"index": i, "speaker_id": "", "score": 0.0}
                     continue
 
-                audio_path = audio_processor.ensure_16k_wav(audio_bytes)
+                audio_path = audio_processor.ensure_16k_wav(audio_bytes, apply_denoise=False)
                 audio_paths.append(audio_path)
                 valid_indices.append(i)
             except Exception as e:
